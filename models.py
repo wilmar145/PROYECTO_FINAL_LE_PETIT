@@ -12,11 +12,11 @@ engine_no_db = create_engine(DATABASE_URL_NO_DB)
 # Crear la base de datos 'test_db' si no existe
 def create_database():
     with engine_no_db.connect() as conn:
-        conn.execute(text("CREATE DATABASE IF NOT EXISTS le_petit_cafe"))
-        print("Base de datos 'le_petit_cafe' creada o ya existía.")
+        conn.execute(text("CREATE DATABASE IF NOT EXISTS lepetit_db"))
+        print("Base de datos 'lepetit_db' creada o ya existía.")
 
 # Ahora conectamos a la base de datos creada (usuario root, sin contraseña)
-DATABASE_URL_WITH_DB = "mysql+mysqlconnector://root:@localhost/le_petit_cafe"
+DATABASE_URL_WITH_DB = "mysql+pymysql://root:@localhost/lepetit_db"
 engine_with_db = create_engine(DATABASE_URL_WITH_DB)
 
 # Sesión para interactuar con la base de datos

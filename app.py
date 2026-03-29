@@ -1,106 +1,201 @@
-import os
-from flask import Flask, redirect, render_template, request, url_for, session
+﻿import os
+from urllib.parse import urlencode
+
+from dotenv import load_dotenv
+from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from flask_cors import CORS
+
 from auth import auth0, oauth
 from models import Cliente, SessionLocal
-from dotenv import load_dotenv
 
+# ==============================
+# CONFIGURACION INICIAL
+# ==============================
 load_dotenv()
 
 app = Flask(__name__)
-# Esta llave es vital para que la sesión no falle
-app.secret_key = "una_clave_muy_secreta_123"
+
+# CAMBIO 1: origen exacto con puerto para que las cookies cross-origin funcionen
+CORS(app, supports_credentials=True, origins=["http://localhost:65403"])
+
+# CAMBIO 2: SameSite='Lax' (no 'None') para que la cookie se envie en HTTP local
+#           Secure=False porque es HTTP (no HTTPS)
+app.config.update(
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=False,
+    SESSION_COOKIE_HTTPONLY=True,
+)
+
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "una_clave_muy_secreta_123")
 oauth.init_app(app)
 
-@app.route('/')
+AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "dev-fnxf4lcudrkaaiuh.us.auth0.com")
+AUTH0_CLIENT_ID = os.getenv("AUTH0_CLIENT_ID", "B6yg1f2RoxUPZMTjhwaxYRATAAeJkSca")
+AUTH0_CALLBACK_URL = os.getenv("AUTH0_CALLBACK_URL", "http://localhost:5000/callback")
+AUTH0_LOGIN_RETURN = os.getenv("AUTH0_LOGIN_RETURN", "http://localhost:5000/login")
+FRONTEND_URL = os.getenv(
+    "FRONTEND_URL",
+    "http://localhost:65403/WebPages/sign_in/iniciar_sesion.html",
+)
+
+
+# ==============================
+# FUNCIONES AUXILIARES
+# ==============================
+def redirect_to_frontend(user):
+    """Redirige al frontend ASP.NET con email y name."""
+    email = user.get("email", "").strip()
+    name = (user.get("name") or user.get("nickname") or email).strip()
+
+    query = urlencode({"email": email, "name": name})
+    return redirect(f"{FRONTEND_URL}?{query}")
+
+
+# ==============================
+# RUTAS
+# ==============================
+@app.route("/")
 def index():
-    user = session.get('user')
-    return render_template('index.html', user=user)
+    user = session.get("user")
+    return render_template("index.html", user=user)
 
-@app.route('/login')
+
+@app.route("/go-to-frontend")
+def go_to_frontend():
+    """Puente seguro hacia el frontend ASP.NET."""
+    user = session.get("user")
+    if not user or not user.get("email"):
+        return redirect(url_for("login"))
+    return redirect_to_frontend(user)
+
+
+@app.route("/login")
 def login():
-    # Forzamos la redirección a 127.0.0.1 para que Auth0 no te rechace
-    return auth0.authorize_redirect(redirect_uri="http://127.0.0.1:5000/callback")
+    # Si ya hay sesion local valida, no pasamos por Auth0 otra vez.
+    user = session.get("user")
+    if user and user.get("email"):
+        return redirect_to_frontend(user)
 
-@app.route('/callback')
-def callback(): # Quitamos 'async' para simplificar
+    # Permite forzar cambio de usuario con /login?force=1
+    force_login = request.args.get("force") == "1"
+    params = {"redirect_uri": AUTH0_CALLBACK_URL}
+    if force_login:
+        params["prompt"] = "login"
+
+    return auth0.authorize_redirect(**params)
+
+
+@app.route("/callback")
+def callback():
     try:
-        # Obtenemos el token sin 'await'
         token = auth0.authorize_access_token()
-        user = token.get('userinfo')
-        
-        if user:
-            session['user'] = user
-            
-            # Registro en MySQL (Punto 3.1)
-            db = SessionLocal()
-            cliente_db = db.query(Cliente).filter(Cliente.correo == user['email']).first()
+        user = token.get("userinfo") or {}
 
-            if not cliente_db:
-                nuevo_cliente = Cliente(
-                    nombre=user['name'], 
-                    correo=user['email'],
-                    password="auth0_user" # Contraseña dummy para usuarios de Auth0
-                )
-                db.add(nuevo_cliente)
-                db.commit()
-            db.close()
+        email = user.get("email", "").strip()
+        if not email:
+            session.clear()
+            return "No se pudo obtener el email del usuario desde Auth0.", 400
 
-            return redirect(url_for('completar_perfil'))
-        
-    except Exception as e:
-        # Si sale error aquí, limpia la sesión e intenta de nuevo
-        session.clear()
-        return f"Error en callback: {str(e)}. Por favor, intenta en modo incógnito.", 400
-
-@app.route('/completar-perfil', methods=['GET', 'POST'])
-def completar_perfil():
-    user = session.get('user')
-    if not user:
-        return redirect(url_for('login'))
-
-    if request.method == 'POST':
-        tipo_doc = request.form.get('tipo_doc')
-        num_doc = request.form.get('num_doc')
+        # Normaliza el nombre para usarlo en frontend y persistencia local.
+        user["name"] = (user.get("name") or user.get("nickname") or email).strip()
+        session["user"] = user
 
         db = SessionLocal()
-        cliente = db.query(Cliente).filter(Cliente.correo == user['email']).first()
-        if cliente:
+        try:
+            cliente = db.query(Cliente).filter(Cliente.correo == email).first()
+
+            if not cliente:
+                cliente = Cliente(
+                    nombre=user["name"],
+                    correo=email,
+                    password="auth0_user",
+                )
+                db.add(cliente)
+                db.commit()
+                db.refresh(cliente)
+
+            if not cliente.numero_documento:
+                return redirect(url_for("completar_perfil"))
+
+            return redirect_to_frontend(user)
+        finally:
+            db.close()
+
+    except Exception as exc:
+        session.clear()
+        return f"Error en callback: {str(exc)}", 400
+
+
+@app.route("/completar-perfil", methods=["GET", "POST"])
+def completar_perfil():
+    user = session.get("user")
+    if not user or not user.get("email"):
+        return redirect(url_for("login", force=1))
+
+    if request.method == "POST":
+        tipo_doc = (request.form.get("tipo_doc") or "").strip()
+        num_doc = (request.form.get("num_doc") or "").strip()
+
+        if not tipo_doc or not num_doc:
+            return render_template(
+                "completar_perfil.html",
+                user=user,
+                error="Debes completar tipo y numero de documento.",
+            )
+
+        db = SessionLocal()
+        try:
+            cliente = db.query(Cliente).filter(Cliente.correo == user["email"]).first()
+            if not cliente:
+                return redirect(url_for("login", force=1))
+
             cliente.tipo_documento = tipo_doc
             cliente.numero_documento = num_doc
             db.commit()
-        db.close()
+        finally:
+            db.close()
 
-        return redirect(url_for('profile'))
+        # Flujo final: formulario completado -> frontend ASP.NET.
+        return redirect_to_frontend(user)
 
-    return render_template('completar_perfil.html', user=user)
+    return render_template("completar_perfil.html", user=user)
 
-@app.route('/profile')
-def profile():
-    user = session.get('user')
-    if not user:
-        return redirect(url_for('login'))
-    
-    db = SessionLocal()
-    cliente = db.query(Cliente).filter(Cliente.correo == user['email']).first()
-    db.close()
-    
-    return render_template('profile.html', user=user, cliente_db=cliente)
 
-@app.route('/logout')
+@app.route("/logout")
 def logout():
     session.clear()
-    # Cambia los datos por los tuyos si no usas .env
-    return redirect(
-        "https://dev-a1rj4fpr7sm4p47r.us.auth0.com/v2/logout?"
-        "client_id=c4tldiH9hMwEo1ZXrJFJb2PhmPkkTnKy&"
-        "returnTo=http://127.0.0.1:5000/"
-    )
-    
-    return redirect(
-        f"https://{domain}/v2/logout?"
-        f"client_id={client_id}&"
-        f"returnTo={url_for('index', _external=True)}"
-    )
 
-if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    params = urlencode(
+        {
+            "client_id": AUTH0_CLIENT_ID,
+            "returnTo": AUTH0_LOGIN_RETURN,
+        }
+    )
+    return redirect(f"https://{AUTH0_DOMAIN}/v2/logout?{params}")
+
+
+# CAMBIO 3: usar jsonify para respuesta correcta con Content-Type application/json
+@app.route('/api/user')
+def get_user():
+    user = session.get('user')
+    if not user:
+        return jsonify({"error": "No autenticado"}), 401
+
+    db = SessionLocal()
+    try:
+        cliente = db.query(Cliente).filter(Cliente.correo == user['email']).first()
+        if not cliente:
+            return jsonify({"error": "Usuario no encontrado"}), 404
+
+        return jsonify({
+            "nombre": cliente.nombre,
+            "correo": cliente.correo,
+            "documento": cliente.numero_documento
+        })
+    finally:
+        db.close()
+
+
+# CAMBIO 4: host='localhost' para que la cookie se genere en localhost (no 127.0.0.1)
+if __name__ == "__main__":
+    app.run(debug=True, host="localhost", port=5000)
